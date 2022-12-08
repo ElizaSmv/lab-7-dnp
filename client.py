@@ -38,12 +38,18 @@ if __name__ == "__main__":
                 r = stub.Suspend(pb2.Per(period=arg))
                 print(f"Sleeping for {arg} seconds")
                 # print(r)
+            elif "setval" == com:
+                key, value = arg.split()
+                r = stub.SetVal(pb2.Set(key=key, value=value))
+                print(r.success)
+            elif "getval" == com:
+                r = stub.GetVal(pb2.Set(value=arg))
+                print(r.key)
             elif "quit" == com:
                 print("The client ends")
                 sys.exit(0)
             else:
                 print("Invalid input")
-
         except KeyboardInterrupt:
             print("Shutting down")
             sys.exit(0)
