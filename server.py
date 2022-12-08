@@ -13,60 +13,71 @@ import raft_pb2 as pb2
 
 class Handler(raft_pb2_grpc.RaftServicer):
 
-    def RequestVote(self, request: pb2.TeId, context) -> pb2.Check:
+    def RequestVote(self, request: pb2.RVArgs, context) -> pb2.Check:
         if d[given_id].sleeping:
             return None
 
         term = request.term  # candidate term
-        candidateid = request.id
-        # print('incoming vote req', candidateid, term)
+        candidateid = request.candidateId
+        lastIndex = request.lastLogIndex
+        lastTerm = request.lastLogTerm
+        # print('incoming vote req', candidateid, term, lastIndex)
 
-        k = d[given_id].term  # my term
+        my_term = d[given_id].term  # my term
+        k = len(d[given_id].logs)
+        my_last_log = d[given_id].logs[k]
 
-        if term > k:
+        if term > my_term:
             d[given_id].term = term
-        if term < k:
-            flag = False
+        if term < my_term:
             d[given_id].last_update = time.time()
-            # print("low term")
-            return pb2.Check(term=k, success=flag)
+            print("low term")
+            return pb2.Check(term=my_term, success=False)
 
-        # print('my vote', d[given_id].vote)
-        if term == d[given_id].term and d[given_id].vote == (False, -1):
-            flag = True
-            d[given_id].vote = (True, candidateid)
-            d[candidateid].votes += 1
-            print(f"Voted for node {candidateid}")
-            if d[given_id].state == "Leader" or d[given_id].state == "Candidate":
-                d[given_id].state = "Follower"
-                print(f"I'm a {d[given_id].state}. Term: {d[given_id].term}")
-                d[given_id].term = term
-                flag = False
-                d[given_id].last_update = time.time()
-                # print("because i was not Follower")
-                return pb2.Check(term=k, success=flag)
-            return pb2.Check(term=k, success=flag)
         if d[given_id].vote[0] and d[given_id].vote[1] != given_id:
             print(f"Not Voted for node {candidateid}")
-            return pb2.Check(term=k, success=False)
-        print("Not voted")
-        return pb2.Check(term=k, success=False)
+            return pb2.Check(term=my_term, success=False)
 
-    def AppendEntries(self, request: pb2.TeId, context) -> pb2.Check:
+        if lastIndex < my_last_log[0]:
+            d[given_id].last_update = time.time()
+            print("low log index")
+            return pb2.Check(term=my_term, success=False)
+
+        if lastIndex == my_last_log[0] and lastTerm != my_last_log[1]:
+            d[given_id].last_update = time.time()
+            print("low log term ")
+            return pb2.Check(term=my_term, success=False)
+
+        d[given_id].vote = (True, candidateid)
+        d[candidateid].votes += 1
+        print(f"Voted for node {candidateid}")
+        return pb2.Check(term=my_term, success=True)
+
+    def AppendEntries(self, request: pb2.AEArgs, context) -> pb2.Check:
         global id_leader
         if d[given_id].sleeping:
             return None
         # print("got heartbeat")
         term = request.term
-        id_leader = request.id
+        id_leader = request.leaderId
+        prev_index = request.prevLogIndex
+        prev_term = request.prevLogTerm
+        ent = request.entries
+        lead_commit = request.leaderCommit
         d[given_id].last_update = time.time()
         if term >= d[given_id].term:
+            d[given_id].term = term
             return pb2.Check(term=d[given_id].term, success=True)
-        if term < d[given_id].term:
+
+        if term < d[given_id].term: # FIXME
             d[given_id].last_update = time.time()
             d[given_id].state = "Follower"
             print(f"I'm a {d[given_id].state}. Term: {d[given_id].term}")
             return pb2.Check(term=d[given_id].term, success=False)
+
+
+
+
 
     def GetLeader(self, request, context) -> pb2.Leader:
         if d[given_id].sleeping:
@@ -99,6 +110,33 @@ class Handler(raft_pb2_grpc.RaftServicer):
         t.start()
         return pb2.Null()
 
+    def SetVal(self, request, context) -> pb2.SetReturn:
+        if d[given_id].sleeping:
+            return None
+        global id_leader
+        key = request.key
+        value = request.value
+        print(f"Command from client: setval {key} {value}")
+        if d[given_id].state == "Candidate":
+            return pb2.SetReturn(success=False)
+        d[id_leader].last_applied += 1 # TODO: That won't update the value of leader
+        temp = (t, d[id_leader].last_applied, f"{key}={value}")
+        # d[id_leader].new_entries.append()
+
+
+
+
+        return pb2.SetReturn()
+
+    def GetVal(self, request, context) -> pb2.GetReturn:
+        if d[given_id].sleeping:
+            return None
+        global id_leader
+        key = request.key
+        print(f"Command from client: getval {key}")
+
+        return pb2.GetReturn()
+
 
 def sleep_callback(x):
     x.sleeping = False
@@ -117,6 +155,13 @@ class Node:
         self.votes = 0
         self.last_update = 0
         self.sleeping = False
+        self.commit_index = 0
+        self.last_applied = 0
+        self.logs = [(0, 0, " ")]
+        self.commands = {}
+        self.new_entries = []
+        self.nextIndex = {} # only for leader
+        self.matchIndex = {} # only for leader
         self.channel = grpc.insecure_channel(f'{addr}:{port}')
         self.stub = pb2_grpc.RaftStub(self.channel)
 
@@ -129,7 +174,12 @@ class Node:
         for k, v in d.items():
             if k != given_id:
                 try:
-                    aaa = pb2.TeId(term=self.term, id=given_id)
+                    last_log_index = self.last_applied
+                    last_log_term = self.logs[last_log_index][1]
+                    aaa = pb2.RVArgs(term=self.term,
+                                     candidateId=given_id,
+                                     lastLogIndex=last_log_index,
+                                     lastLogTerm=last_log_term)
                     r = v.stub.RequestVote(aaa)
                 except grpc.RpcError as e:
                     continue
@@ -169,14 +219,20 @@ class Node:
         print('term', self.term)
 
     def leader(self):
-        # print(f"I'm a {self.state}. Term: {self.term}")
+        print(f"I'm a {self.state}. Term: {self.term}")
         for k, v in d.items():
             if k != given_id:
-                t.submit(v.heartbeat, self.term, given_id)
+                if len(self.new_entries) == 0:
+                    print("Heart beat")
+                    t.submit(v.heartbeat, self.term, given_id, (), self.commit_index)
+                else:
+                    for e in self.new_entries:
+                        print("Append entries")
+                        t.submit(v.heartbeat, self.term, given_id, e, self.commit_index)
         time.sleep(0.05)
 
     def start_server(self):
-        print(f"I'm a {self.state}. Term: {self.term}")
+        # print(f"I'm a {self.state}. Term: {self.term}")
         while True:
             if self.sleeping:
                 continue
@@ -187,16 +243,20 @@ class Node:
             if self.state == "Leader":
                 self.leader()
 
-    def heartbeat(self, term, leader_id):
+    def heartbeat(self, term, leader_id, entries, commit): # FIXME
         try:
             # print(f"send hb to {self.port}")
-            hbeat = self.stub.AppendEntries(pb2.TeId(term=term, id=leader_id))
+            # append = self.stub.AppendEntries(pb2.AEArgs(term=term,
+                                                        leaderId=leader_id,
+                                                        prevLogIndex=,
+                                                        prevLogTerm=,
+                                                        entries=entries,
+                                                        leaderCommit=commit))
             # print("Delivered heartbeat")
-            return hbeat
+            # return append
         except grpc.RpcError as e:
             # print("heartbeat error", e)
             return None
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Server receive data')
